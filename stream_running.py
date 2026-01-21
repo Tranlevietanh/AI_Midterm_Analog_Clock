@@ -2,22 +2,26 @@ import os
 import cv2
 import time
 from ultralytics import YOLO
-from datetime import datetime
 import torch
 import einops
 import torch.nn as nn
 import torchvision.models as models
 from clock_utils import warp
+from collections import deque
 
 # ================== CONFIG ==================
 YOLO_MODEL_PATH = r"D:\Bai tap\Visual Studio for Python\Midterm\YOLO_customized.pt"
 CLOCK_CLASS_ID = 0
-CONFIDENCE_THRESHOLD = 0.7
-PROCESS_INTERVAL = 2.0   # seconds
+
+CONFIDENCE_THRESHOLD = 0.4
+IOU_THRESHOLD = 0.5
+
+PROCESS_INTERVAL = 1.0   # seconds (time recognition)
+BOX_WINDOW = 3         # ~1 second at 15 FPS
 CROP_MARGIN = 0.12
 
-TIME_MODEL_PATH = r"D:\Bai tap\Visual Studio for Python\Midterm\full.pth"
-STN_MODEL_PATH  = r"D:\Bai tap\Visual Studio for Python\Midterm\full_st.pth"
+TIME_MODEL_PATH = r"C:\Users\VBK computer\Downloads\best_model.pth"
+STN_MODEL_PATH  = r"C:\Users\VBK computer\Downloads\best_model_stn.pth"
 
 # ================== LOAD YOLO ==================
 yolo = YOLO(YOLO_MODEL_PATH)
@@ -26,7 +30,7 @@ yolo = YOLO(YOLO_MODEL_PATH)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 model_stn = models.resnet50(pretrained=False)
-model_stn.fc = nn.Linear(2048, 8 )
+model_stn.fc = nn.Linear(2048, 8)
 
 model_time = models.resnet50(pretrained=False)
 model_time.fc = nn.Linear(2048, 720)
@@ -37,7 +41,31 @@ model_stn.load_state_dict(torch.load(STN_MODEL_PATH, map_location=device))
 model_time.to(device).eval()
 model_stn.to(device).eval()
 
-# ================== CLOCK READER FUNCTION ==================
+# ================== HELPERS ==================
+def compute_iou(b1, b2):
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
+
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    if inter == 0:
+        return 0.0
+
+    a1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+    a2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+    return inter / (a1 + a2 - inter)
+
+def average_box(boxes):
+    xs1, ys1, xs2, ys2 = zip(*boxes)
+    return (
+        int(sum(xs1) / len(xs1)),
+        int(sum(ys1) / len(ys1)),
+        int(sum(xs2) / len(xs2)),
+        int(sum(ys2) / len(ys2)),
+    )
+
+# ================== CLOCK READER ==================
 def read_clock_time(cropped_img):
     img = cv2.resize(cropped_img, (224, 224)) / 255.0
     img = einops.rearrange(img, 'h w c -> c h w')
@@ -49,7 +77,6 @@ def read_clock_time(cropped_img):
         Minv_pred = pred_st.view(-1, 3, 3)
 
         img_warped = warp(img, Minv_pred)
-
         pred = model_time(img_warped)
         idx = torch.argmax(pred, dim=1)[0]
 
@@ -65,32 +92,36 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 15)
 
 cv2.namedWindow("Auto Clock Reader System", cv2.WINDOW_NORMAL)
-# This allows you to drag the corner of the window to make it larger
 
 last_process_time = 0.0
-last_read_time = None
+box_buffers = {}     # track_id -> deque
+clock_results = {}   # track_id -> "HH:MM"
 
 print("=== AUTO ANALOG CLOCK READER ===")
 
-
-clock_results = {} # Stores {track_id: "HH:MM"}
-
 while True:
     ret, frame = cap.read()
-    if not ret: break
+    if not ret:
+        break
 
-    # 1. Use track() instead of predict() to get persistent IDs
-    # persist=True keeps the IDs alive across frames
-    results = yolo.track(frame, persist=True, verbose=False, conf=CONFIDENCE_THRESHOLD)
-
+    h, w = frame.shape[:2]
     current_time = time.time()
     can_process = (current_time - last_process_time) > PROCESS_INTERVAL
+
+    results = yolo.track(
+        frame,
+        persist=True,
+        verbose=False,
+        conf=CONFIDENCE_THRESHOLD,
+        iou=IOU_THRESHOLD
+    )
+
+    active_ids = set()
 
     for result in results:
         if result.boxes is None or result.boxes.id is None:
             continue
 
-        # Get boxes, class IDs, and Track IDs
         boxes = result.boxes.xyxy.cpu().numpy()
         track_ids = result.boxes.id.int().cpu().tolist()
         clss = result.boxes.cls.cpu().tolist()
@@ -99,60 +130,57 @@ while True:
             if cls != CLOCK_CLASS_ID:
                 continue
 
-            x1, y1, x2, y2 = map(int, box)
+            active_ids.add(track_id)
 
-            # ---- Draw bbox and ID ----
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"ID: {track_id}", (x1, y1 - 10), 
+            x1, y1, x2, y2 = map(int, box)
+            current_box = (x1, y1, x2, y2)
+
+            if track_id not in box_buffers:
+                box_buffers[track_id] = deque(maxlen=BOX_WINDOW)
+
+            if len(box_buffers[track_id]) > 0:
+                prev_box = box_buffers[track_id][-1]
+                if compute_iou(prev_box, current_box) < 0.3:
+                    continue
+
+            box_buffers[track_id].append(current_box)
+            avg_box = average_box(box_buffers[track_id])
+            ax1, ay1, ax2, ay2 = avg_box
+
+            # Draw averaged box
+            cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (0, 255, 0), 2)
+            cv2.putText(frame, f"ID: {track_id}", (ax1, ay1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # ---- Read time (interval-based) ----
+            # Recognition (1 Hz)
             if can_process:
-                h, w = frame.shape[:2]
-                bw, bh = x2 - x1, y2 - y1
-                
-                x1m = max(0, int(x1 - CROP_MARGIN * bw))
-                y1m = max(0, int(y1 - CROP_MARGIN * bh))
-                x2m = min(w, int(x2 + CROP_MARGIN * bw))
-                y2m = min(h, int(y2 + CROP_MARGIN * bh))
+                bw, bh = ax2 - ax1, ay2 - ay1
+                x1m = max(0, int(ax1 - CROP_MARGIN * bw))
+                y1m = max(0, int(ay1 - CROP_MARGIN * bh))
+                x2m = min(w, int(ax2 + CROP_MARGIN * bw))
+                y2m = min(h, int(ay2 + CROP_MARGIN * bh))
 
-                cropped_clock = frame[y1m:y2m, x1m:x2m].copy()
-
-                if cropped_clock.size > 0:
-                    hour, minute = read_clock_time(cropped_clock)
-                    # Map the time to the unique Track ID
+                crop = frame[y1m:y2m, x1m:x2m]
+                if crop.size > 0:
+                    hour, minute = read_clock_time(crop)
                     clock_results[track_id] = f"{hour:02d}:{minute:02d}"
 
-            # ---- Display time for this specific ID ----
             if track_id in clock_results:
-                time_display = clock_results[track_id]
-                cv2.putText(frame, time_display, (x1, y1 - 35), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+                cv2.putText(frame, clock_results[track_id],
+                            (ax1, ay1 - 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (255, 255, 0), 2)
 
     if can_process:
         last_process_time = current_time
 
-    # ---- Overlay time ----
-    if last_read_time is not None:
-        cv2.putText(frame,
-                    f"Time: {last_read_time}",
-                    (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (255, 255, 0),
-                    2)
-
-    if not can_process:
-        cv2.putText(frame,
-                    "Cooldown...",
-                    (10, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),
-                    2)
+    # Cleanup dead tracks
+    for tid in list(box_buffers.keys()):
+        if tid not in active_ids:
+            del box_buffers[tid]
+            clock_results.pop(tid, None)
 
     cv2.imshow("Auto Clock Reader System", frame)
-
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
