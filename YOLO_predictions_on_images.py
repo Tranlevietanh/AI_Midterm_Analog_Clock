@@ -4,7 +4,7 @@ import time
 from ultralytics import YOLO
 
 model = YOLO(r"C:\Users\VBK computer\Downloads\best.pt")
-CLOCK_CLASS_ID = 0 #clock ID là 0 cho mô hình customized, nhưng là 74 với mô hình "YOLO11n.pt" gốc
+CLOCK_CLASS_ID = 0
 
 image_folder = r'D:\Bai tap\Visual Studio for Python\watch_photos - Copy\Clock_3\images\val'
 output_folder = r'D:\Bai tap\Visual Studio for Python\watch_photos_val_new'
@@ -44,7 +44,7 @@ for img_path in image_paths:
             cls = int(box.cls[0])
 
             if cls != CLOCK_CLASS_ID:
-                continue  # skip non-clock objects
+                continue  
 
             found_clock = True
 
@@ -71,3 +71,4 @@ for img_path in image_paths:
     #print(f"Total time: {total_time:.2f} sec")
     #print(f"Average inference time: {total_time / count:.3f} sec/image")
     #print(f"FPS: {count / total_time:.2f}")#
+
